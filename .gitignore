@@ -4,3 +4,8 @@
 *.ptx
 *.cubin
 *.fatbin
+
+/NVIDIA_CUDA-11.2_Samples/
+/.vscode/
+*.pdf
+*.ps1
