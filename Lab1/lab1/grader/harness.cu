@@ -1,5 +1,4 @@
-/*
- * harness.cu — 评测主程序
+/* hrness.cu — 评测主程序
  *
  * 用法：./harness <N> <repeats>
  *   N       - 数组长度
@@ -14,8 +13,6 @@
 #include <cstdlib>
 #include <cmath>
 #include <cuda_runtime.h>
-#include <thrust/scan.h>
-#include <thrust/execution_policy.h>
 
 // 学生实现的接口声明
 extern void student_prefix_sum(float* d_in, float* d_out, int n);
@@ -52,6 +49,12 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n; ++i)
         h_in[i] = (float)(rand() % 100) / 10.0f;  // [0, 10)
 
+    // ---- CPU 串行前缀和作为参考答案（inclusive scan）----
+    float* h_ref = new float[n];
+    h_ref[0] = h_in[0];
+    for (int i = 1; i < n; ++i)
+        h_ref[i] = h_ref[i - 1] + h_in[i];
+
     // ---- device 内存 ----
     float *d_in, *d_out, *d_ref;
     int   *d_err;
@@ -60,10 +63,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_ref, n * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_err, sizeof(int)));
 
-    CUDA_CHECK(cudaMemcpy(d_in, h_in, n * sizeof(float), cudaMemcpyHostToDevice));
-
-    // ---- GPU 参考答案（Thrust inclusive scan）----
-    thrust::inclusive_scan(thrust::device, d_in, d_in + n, d_ref);
+    CUDA_CHECK(cudaMemcpy(d_in,  h_in,  n * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ref, h_ref, n * sizeof(float), cudaMemcpyHostToDevice));
 
     // ---- Warmup ----
     student_prefix_sum(d_in, d_out, n);
@@ -89,6 +90,7 @@ int main(int argc, char** argv) {
                err_idx, got, expected);
         cudaFree(d_in); cudaFree(d_out); cudaFree(d_ref); cudaFree(d_err);
         delete[] h_in;
+        delete[] h_ref;
         return 0;
     }
 
@@ -116,5 +118,6 @@ int main(int argc, char** argv) {
     cudaFree(d_ref);
     cudaFree(d_err);
     delete[] h_in;
+    delete[] h_ref;
     return 0;
 }
