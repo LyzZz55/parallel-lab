@@ -27,27 +27,27 @@
 #define BLOCK_SIZE 512   // 块大小，适配 K20c 架构
 
 // 块内扫描内核：计算每个块的排他前缀和，并记录块总和
-__global__ void block_scan(float* d_in, float* d_out, float* d_block_sums, int n) {
-    __shared__ float temp[BLOCK_SIZE];
+__global__ void block_scan(int* d_in, int* d_out, int* d_block_sums, int n) {
+    __shared__ int temp[BLOCK_SIZE];
     int tid = threadIdx.x;
     int bid = blockIdx.x;
     int idx = bid * BLOCK_SIZE + tid;
 
     // 加载数据，超范围补0
-    float val = (idx < n) ? d_in[idx] : 0.0f;
+    int val = (idx < n) ? d_in[idx] : 0.0f;
     temp[tid] = val;
     __syncthreads();
 
     // Kogge-Stone 扫描（单缓冲区）
     for (int offset = 1; offset < BLOCK_SIZE; offset <<= 1) {
-        float t = 0.0f;
+        int t = 0.0f;
         if (tid >= offset) t = temp[tid - offset];
         __syncthreads();
         if (tid >= offset) temp[tid] += t;
         __syncthreads();
     }
 
-    float inclusive = temp[tid];   // 包含当前元素的扫描和
+    int inclusive = temp[tid];   // 包含当前元素的扫描和
 
     // 输出排他前缀和（全局暂时排他，后续加块间偏移）
     if (idx < n) {
@@ -65,7 +65,7 @@ __global__ void block_scan(float* d_in, float* d_out, float* d_block_sums, int n
 
 
 // 将块前缀和加到各个元素上
-__global__ void add_block_sums(float* d_out, float* d_block_sums_scanned, int n) {
+__global__ void add_block_sums(int* d_out, int* d_block_sums_scanned, int n) {
     int tid = threadIdx.x;
     int bid = blockIdx.x;
     int idx = bid * BLOCK_SIZE + tid;
@@ -74,7 +74,7 @@ __global__ void add_block_sums(float* d_out, float* d_block_sums_scanned, int n)
     }
 }
 
-__global__ void convert_to_inclusive(float* d_out, float* d_in, int n) {
+__global__ void convert_to_inclusive(int* d_out, int* d_in, int n) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < n) d_out[idx] += d_in[idx];
 }
@@ -84,7 +84,7 @@ __global__ void convert_to_inclusive(float* d_out, float* d_in, int n) {
 // naive 示例：单线程顺序扫描（仅供参考，性能极差）
 // 请用高效并行实现替换 student_prefix_sum 的函数体。
 // ------------------------------------------------------------
-__global__ void naive_scan_kernel(const float* in, float* out, int n) {
+__global__ void naive_scan_kernel(const int* in, int* out, int n) {
     // 只用 1 个线程顺序计算，等价于 CPU 实现
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         out[0] = in[0];
@@ -95,11 +95,11 @@ __global__ void naive_scan_kernel(const float* in, float* out, int n) {
 
 // ------------------------------------------------------------
 // 主接口：不得修改函数签名
-//   d_in  - device 端输入数组（长度 n，float）
-//   d_out - device 端输出数组（长度 n，float）
+//   d_in  - device 端输入数组（长度 n，int）
+//   d_out - device 端输出数组（长度 n，int）
 //   n     - 元素个数
 // ------------------------------------------------------------
-void student_prefix_sum(float* d_in, float* d_out, int n) {
+void student_prefix_sum(int* d_in, int* d_out, int n) {
     // TODO: 用高效并行实现替换下面这行代码
     //
     // naive_scan_kernel<<<1, 1>>>(d_in, d_out, n);
@@ -122,16 +122,16 @@ void student_prefix_sum(float* d_in, float* d_out, int n) {
 
     // 情况2：需要多级处理
     // 分配块总和数组
-    float* d_block_sums;
-    cudaMalloc(&d_block_sums, num_blocks * sizeof(float));
+    int* d_block_sums;
+    cudaMalloc(&d_block_sums, num_blocks * sizeof(int));
 
     // 第一遍扫描：块内前缀和 + 块总和
     block_scan<<<num_blocks, BLOCK_SIZE>>>(d_in, d_out, d_block_sums, n);
     cudaDeviceSynchronize();
 
     // 分配空间存放块总和的前缀和结果
-    float* d_block_sums_scanned;
-    cudaMalloc(&d_block_sums_scanned, num_blocks * sizeof(float));
+    int* d_block_sums_scanned;
+    cudaMalloc(&d_block_sums_scanned, num_blocks * sizeof(int));
 
     // 递归计算块总和的前缀和
     student_prefix_sum(d_block_sums, d_block_sums_scanned, num_blocks);

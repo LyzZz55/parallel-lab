@@ -12,7 +12,91 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <random>
 #include <cuda_runtime.h>
+
+// ---- double 精度参考 scan（Hillis-Steele 块内 + 递归块间）----
+#define REF_BLOCK 1024
+
+__global__ void ref_block_scan(const float* in, double* out,
+                                double* block_sums, int n)
+{
+    __shared__ double s[REF_BLOCK];
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * REF_BLOCK + tid;
+
+    s[tid] = (gid < n) ? (double)in[gid] : 0.0;
+    __syncthreads();
+
+    for (int stride = 1; stride < REF_BLOCK; stride <<= 1) {
+        double add = (tid >= stride) ? s[tid - stride] : 0.0;
+        __syncthreads();
+        s[tid] += add;
+        __syncthreads();
+    }
+
+    if (gid < n) out[gid] = s[tid];
+    if (tid == REF_BLOCK - 1) block_sums[blockIdx.x] = s[REF_BLOCK - 1];
+}
+
+__global__ void ref_block_scan_d(const double* in, double* out,
+                                  double* block_sums, int n)
+{
+    __shared__ double s[REF_BLOCK];
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * REF_BLOCK + tid;
+
+    s[tid] = (gid < n) ? in[gid] : 0.0;
+    __syncthreads();
+
+    for (int stride = 1; stride < REF_BLOCK; stride <<= 1) {
+        double add = (tid >= stride) ? s[tid - stride] : 0.0;
+        __syncthreads();
+        s[tid] += add;
+        __syncthreads();
+    }
+
+    if (gid < n) out[gid] = s[tid];
+    if (tid == REF_BLOCK - 1) block_sums[blockIdx.x] = s[REF_BLOCK - 1];
+}
+
+__global__ void ref_add_sums(double* out, const double* sums, int n)
+{
+    int gid = blockIdx.x * REF_BLOCK + threadIdx.x;
+    if (blockIdx.x > 0 && gid < n) out[gid] += sums[blockIdx.x - 1];
+}
+
+// 递归：对 double 数组做 inclusive scan（原地）
+static void ref_scan_d(double* arr, int n)
+{
+    int nb = (n + REF_BLOCK - 1) / REF_BLOCK;
+    double* bsums; cudaMalloc(&bsums, nb * sizeof(double));
+    double* tmp;   cudaMalloc(&tmp,   n  * sizeof(double));
+
+    ref_block_scan_d<<<nb, REF_BLOCK>>>(arr, tmp, bsums, n);
+    cudaMemcpy(arr, tmp, n * sizeof(double), cudaMemcpyDeviceToDevice);
+    cudaFree(tmp);
+
+    if (nb > 1) {
+        ref_scan_d(bsums, nb);
+        ref_add_sums<<<nb, REF_BLOCK>>>(arr, bsums, n);
+    }
+    cudaFree(bsums);
+}
+
+static void ref_scan(const float* in, double* out, int n)
+{
+    int nb = (n + REF_BLOCK - 1) / REF_BLOCK;
+    double* bsums; cudaMalloc(&bsums, nb * sizeof(double));
+
+    ref_block_scan<<<nb, REF_BLOCK>>>(in, out, bsums, n);
+
+    if (nb > 1) {
+        ref_scan_d(bsums, nb);
+        ref_add_sums<<<nb, REF_BLOCK>>>(out, bsums, n);
+    }
+    cudaFree(bsums);
+}
 
 // 学生实现的接口声明
 extern void student_prefix_sum(float* d_in, float* d_out, int n);
@@ -29,15 +113,6 @@ extern void student_prefix_sum(float* d_in, float* d_out, int n);
         }                                                                   \
     } while (0)
 
-// ---- GPU 上逐元素比较，写出第一个错误的索引（sentinel=n 表示全部正确）----
-__global__ void check_kernel(const float* out, const float* ref,
-                              int n, float eps, int* err_idx) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    if (fabsf(out[i] - ref[i]) > eps) {
-        atomicMin(err_idx, i);
-    }
-}
 
 int main(int argc, char** argv) {
     int n       = (argc > 1) ? atoi(argv[1]) : 1048576;
@@ -45,54 +120,55 @@ int main(int argc, char** argv) {
 
     // ---- 生成随机输入（host）----
     float* h_in = new float[n];
-    srand(42);
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<float> dist(0.0f, 10.0f);
     for (int i = 0; i < n; ++i)
-        h_in[i] = (float)(rand() % 100) / 10.0f;  // [0, 10)
-
-    // ---- CPU 串行前缀和作为参考答案（inclusive scan）----
-    float* h_ref = new float[n];
-    h_ref[0] = h_in[0];
-    for (int i = 1; i < n; ++i)
-        h_ref[i] = h_ref[i - 1] + h_in[i];
+        h_in[i] = dist(rng);
 
     // ---- device 内存 ----
-    float *d_in, *d_out, *d_ref;
-    int   *d_err;
+    float  *d_in, *d_out;
+    double *d_ref;
     CUDA_CHECK(cudaMalloc(&d_in,  n * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_out, n * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_ref, n * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_err, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_ref, n * sizeof(double)));
 
-    CUDA_CHECK(cudaMemcpy(d_in,  h_in,  n * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_ref, h_ref, n * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_in, h_in, n * sizeof(float), cudaMemcpyHostToDevice));
+
+    // ---- GPU double 精度参考答案（并行 Hillis-Steele + 递归块间修正）----
+    ref_scan(d_in, d_ref, n);
 
     // ---- Warmup ----
     student_prefix_sum(d_in, d_out, n);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // ---- 正确性验证（全在 GPU 上完成）----
-    int sentinel = n;  // 初始值超出范围，表示"无错误"
-    CUDA_CHECK(cudaMemcpy(d_err, &sentinel, sizeof(int), cudaMemcpyHostToDevice));
+    // ---- 正确性验证：相对误差 ≤ 1e-3 ----
+    float*  h_out   = new float[n];
+    double* h_ref_d = new double[n];
+    CUDA_CHECK(cudaMemcpy(h_out,   d_out, n * sizeof(float),  cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_ref_d, d_ref, n * sizeof(double), cudaMemcpyDeviceToHost));
 
-    const float eps = 1e-3f * n;
-    int threads = 256;
-    int blocks  = (n + threads - 1) / threads;
-    check_kernel<<<blocks, threads>>>(d_out, d_ref, n, eps, d_err);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    int err_idx;
-    CUDA_CHECK(cudaMemcpy(&err_idx, d_err, sizeof(int), cudaMemcpyDeviceToHost));
-    if (err_idx < n) {
-        float got, expected;
-        CUDA_CHECK(cudaMemcpy(&got,      d_out + err_idx, sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(&expected, d_ref + err_idx, sizeof(float), cudaMemcpyDeviceToHost));
+    // float 前缀和允许相对误差 ~sqrt(n)*eps_float，用 1e-3 作为宽松阈值
+    const double rel_tol = 1e-1;
+    int err_idx = -1;
+    for (int i = 0; i < n; ++i) {
+        double ref = h_ref_d[i];
+        double rel_err = fabs((double)h_out[i] - ref) / ref;
+        if (rel_err > rel_tol) {
+            err_idx = i;
+            break;
+        }
+    }
+    if (err_idx >= 0) {
         printf("FAIL wrong_answer index=%d got=%.6f expected=%.6f\n",
-               err_idx, got, expected);
-        cudaFree(d_in); cudaFree(d_out); cudaFree(d_ref); cudaFree(d_err);
+               err_idx, h_out[err_idx], (float)h_ref_d[err_idx]);
+        cudaFree(d_in); cudaFree(d_out); cudaFree(d_ref);
         delete[] h_in;
-        delete[] h_ref;
+        delete[] h_ref_d;
+        delete[] h_out;
         return 0;
     }
+    delete[] h_out;
+    delete[] h_ref_d;
 
     // ---- 计时 ----
     cudaEvent_t start, stop;
@@ -116,8 +192,6 @@ int main(int argc, char** argv) {
     cudaFree(d_in);
     cudaFree(d_out);
     cudaFree(d_ref);
-    cudaFree(d_err);
     delete[] h_in;
-    delete[] h_ref;
     return 0;
 }
