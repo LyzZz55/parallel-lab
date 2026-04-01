@@ -27,7 +27,7 @@
 
 #define BLOCK_SIZE 512
 
-__global__ void block_scan(int* d_in, int* d_out, int* d_block_sums, int n) {
+__global__ void block_scan(const int* d_in, int* d_out, int* d_block_sums, int n) {
     __shared__ int temp[BLOCK_SIZE][2];
     int tid = threadIdx.x;
     int bid = blockIdx.x;
@@ -72,7 +72,7 @@ __global__ void add_block_sums(int* d_out, int* d_block_sums_scanned, int n) {
 //   d_out - device 端输出数组（长度 n, int）
 //   n     - 元素个数
 // ------------------------------------------------------------
-void student_prefix_sum(int* d_in, int* d_out, int n) {
+void student_prefix_sum(const int* d_in, int* d_out, int n) {
     if (n <= 0) return;
 
     int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;

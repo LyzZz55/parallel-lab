@@ -15,7 +15,7 @@
 #include <cuda_runtime.h>
 
 // ---- 学生实现的接口声明 ----
-extern void student_prefix_sum(int* d_in, int* d_out, int n);
+extern void student_prefix_sum(const int* d_in, int* d_out, int n);
 
 // ---- CUDA 错误检查宏 ----
 #define CUDA_CHECK(call)                                                    \
