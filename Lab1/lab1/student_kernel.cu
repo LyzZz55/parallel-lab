@@ -27,12 +27,11 @@
 
 #define BLOCK_SIZE 512
 #define WARP_SIZE 32
-
+#define WARP_PER_BLOCK BLOCK_SIZE/WARP_SIZE
 // 使用 warp shuffle 的高效 block 级 scan kernel
 // 每个 block 计算局部的 inclusive prefix sum，并可选地输出 block 总和
 __global__ void warp_block_scan(const int* d_in, int* d_out, int* d_block_sums, int n) {
-    // 共享内存：存储每个 warp 的总和（最多 512/32 = 16 个 warp）
-    __shared__ int warp_scan[16];
+    __shared__ int warp_scan[WARP_PER_BLOCK];
 
     int tid = threadIdx.x;
     int lane_id = tid & (WARP_SIZE - 1);   // 线程在 warp 内的编号 (0~31)
@@ -58,14 +57,15 @@ __global__ void warp_block_scan(const int* d_in, int* d_out, int* d_block_sums, 
     // 4. 对 warp 总和进行 exclusive scan（使用第一个 warp）
     if (warp_id == 0) {
         int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
-        // 只让第一个 warp 的 lane0 顺序扫描，其他线程空闲
-        if (lane_id == 0) {
-            int sum = 0;
-            for (int i = 0; i < num_warps; ++i) {
-                int wsum = warp_scan[i];
-                warp_scan[i] = sum;    // 存储前面 warp 的累计和（exclusive）
-                sum += wsum;
-            }
+        int sum = (lane_id < num_warps) ? warp_scan[lane_id] : 0;
+        // 在 warp 内进行 inclusive scan
+        #pragma unroll
+        for (int offset = 1; offset < WARP_PER_BLOCK; offset <<= 1) {
+            int n_sum = __shfl_up_sync(0xffffffff, sum, offset);
+            if (lane_id >= offset) sum += n_sum;
+        }
+        if (lane_id < num_warps) {
+            warp_scan[lane_id] = (lane_id!=0)*__shfl_up_sync(0xffffffff, sum, 1);
         }
     }
     __syncthreads();
