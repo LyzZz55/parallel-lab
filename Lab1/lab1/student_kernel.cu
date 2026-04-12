@@ -17,7 +17,7 @@ __global__ void warp_block_scan_items(const int* d_in, int* d_out, int* d_block_
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
         int idx = base_idx + i;
-        val[i] = (idx < n) ? d_in[idx] : 0;
+        val[i] = (idx < n) ? __ldg(&d_in[idx]) : 0;
     }
 
     #pragma unroll
@@ -88,7 +88,7 @@ __global__ void add_block_sums_items(int* d_out, int* d_block_sums_scanned, int 
     int tid = threadIdx.x;
     int bid = blockIdx.x;
     int base_idx = (bid * blockDim.x + tid) * ITEMS_PER_THREAD;
-    int offset = (bid > 0) ? d_block_sums_scanned[bid - 1] : 0;
+    int offset = (bid > 0) ? __ldg(&d_block_sums_scanned[bid - 1]) : 0;
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
         int idx = base_idx + i;

@@ -9,3 +9,11 @@ run:
 	./grader/harness 1048576
 	./grader/harness 167772160
 
+push:
+	cp student_kernel.cu ~/hw1-submissions/刘英哲_2300012753/
+
+pull:
+	cp -r ~/hw1-submissions ./
+
+test:
+	./test.sh
