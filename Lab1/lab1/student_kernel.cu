@@ -26,37 +26,66 @@
 // ------------------------------------------------------------
 
 #define BLOCK_SIZE 512
+#define WARP_SIZE 32
 
-__global__ void block_scan(const int* d_in, int* d_out, int* d_block_sums, int n) {
-    __shared__ int temp[BLOCK_SIZE][2];
+// 使用 warp shuffle 的高效 block 级 scan kernel
+// 每个 block 计算局部的 inclusive prefix sum，并可选地输出 block 总和
+__global__ void warp_block_scan(const int* d_in, int* d_out, int* d_block_sums, int n) {
+    // 共享内存：存储每个 warp 的总和（最多 512/32 = 16 个 warp）
+    __shared__ int warp_scan[16];
+
     int tid = threadIdx.x;
-    int bid = blockIdx.x;
-    int idx = bid * BLOCK_SIZE + tid;
+    int lane_id = tid & (WARP_SIZE - 1);   // 线程在 warp 内的编号 (0~31)
+    int warp_id = tid / WARP_SIZE;         // warp 索引
+    int idx = blockIdx.x * blockDim.x + tid;
 
+    // 1. 加载数据，超出范围的补 0
     int val = (idx < n) ? d_in[idx] : 0;
-    temp[tid][0] = val;
+
+    // 2. 在 warp 内部进行 inclusive scan（利用 shuffle 指令）
+    #pragma unroll
+    for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+        int n_val = __shfl_up_sync(0xffffffff, val, offset);
+        if (lane_id >= offset) val += n_val;
+    }
+
+    // 3. 每个 warp 的最后一个线程将 warp 总和存入共享内存
+    if (lane_id == WARP_SIZE - 1) {
+        warp_scan[warp_id] = val;
+    }
     __syncthreads();
-    int src = 0;
-    int dst = 1;
 
-    for (int offset = 1; offset < BLOCK_SIZE; offset <<= 1) {
-        if(tid>=offset) temp[tid][dst] = temp[tid][src] + temp[tid-offset][src];
-        else temp[tid][dst] = temp[tid][src];
-        src = dst;
-        dst = dst^1;
-        __syncthreads();
+    // 4. 对 warp 总和进行 exclusive scan（使用第一个 warp）
+    if (warp_id == 0) {
+        int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+        // 只让第一个 warp 的 lane0 顺序扫描，其他线程空闲
+        if (lane_id == 0) {
+            int sum = 0;
+            for (int i = 0; i < num_warps; ++i) {
+                int wsum = warp_scan[i];
+                warp_scan[i] = sum;    // 存储前面 warp 的累计和（exclusive）
+                sum += wsum;
+            }
+        }
     }
+    __syncthreads();
 
+    // 5. 将当前 warp 内的前缀和加上前面 warp 的累计和，得到最终前缀和
+    int prefix = warp_scan[warp_id];
+    val += prefix;
+
+    // 6. 写回结果（仅有效线程）
     if (idx < n) {
-        d_out[idx] = temp[tid][src];
+        d_out[idx] = val;
     }
 
-    if (d_block_sums && tid == BLOCK_SIZE - 1) {
-        d_block_sums[bid] = temp[BLOCK_SIZE - 1][src];
+    // 7. 如果需要，由最后一个线程输出 block 的总和
+    if (d_block_sums && tid == blockDim.x - 1) {
+        d_block_sums[blockIdx.x] = val;
     }
 }
 
-
+// 辅助 kernel：为每个元素加上对应 block 的前缀偏移量（来自 block sums 的 scan 结果）
 __global__ void add_block_sums(int* d_out, int* d_block_sums_scanned, int n) {
     int tid = threadIdx.x;
     int bid = blockIdx.x;
@@ -77,29 +106,28 @@ void student_prefix_sum(const int* d_in, int* d_out, int n) {
 
     int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
+    // 单 block 情况：直接 scan 即可
     if (num_blocks == 1) {
-
-        block_scan<<<1, BLOCK_SIZE>>>(d_in, d_out, nullptr, n);
+        warp_block_scan<<<1, BLOCK_SIZE>>>(d_in, d_out, nullptr, n);
         cudaDeviceSynchronize();
         return;
     }
 
-
+    // 多 block 情况：先计算每个 block 的局部 scan 和 block 总和
     int* d_block_sums;
     cudaMalloc(&d_block_sums, num_blocks * sizeof(int));
-
-    block_scan<<<num_blocks, BLOCK_SIZE>>>(d_in, d_out, d_block_sums, n);
+    warp_block_scan<<<num_blocks, BLOCK_SIZE>>>(d_in, d_out, d_block_sums, n);
     cudaDeviceSynchronize();
 
+    // 递归计算 block 总和的 scan（得到每个 block 之前的前缀和）
     int* d_block_sums_scanned;
     cudaMalloc(&d_block_sums_scanned, num_blocks * sizeof(int));
-
     student_prefix_sum(d_block_sums, d_block_sums_scanned, num_blocks);
+
+    // 将 block 偏移量加到对应的输出元素上
     add_block_sums<<<num_blocks, BLOCK_SIZE>>>(d_out, d_block_sums_scanned, n);
     cudaDeviceSynchronize();
 
     cudaFree(d_block_sums);
     cudaFree(d_block_sums_scanned);
-
-    return;
 }

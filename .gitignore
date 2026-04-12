@@ -9,3 +9,5 @@
 /.vscode/
 *.pdf
 *.ps1
+/Lab1/hw1-submissions/
+/Lab1/test.sh
