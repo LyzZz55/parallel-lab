@@ -1,5 +1,27 @@
 ﻿#include <cuda_runtime.h>
 
+/*
+ * ============================================================
+ *  并行计算课程作业：CUDA 前缀和（Inclusive Scan）
+ *  刘英哲 2300012753
+ * ============================================================
+ *
+ * 任务：实现一个高效的 CUDA inclusive prefix sum kernel。
+ *
+ * 给定长度为 n 的整型数组 d_in，计算：
+ *   d_out[i] = d_in[0] + d_in[1] + ... + d_in[i]
+ *
+ * 要求：
+ *   1. 只修改本文件（可添加辅助 kernel / 设备函数）
+ *   2. 不得修改 student_prefix_sum 的函数签名
+ *   3. 不得使用 Thrust / cuBLAS / cub 等高级库
+ *   4. 需正确处理任意长度 n（不保证是 2 的幂次）
+ *
+ * 提交：将本文件上传至提交系统，文件名保持 student_kernel.cu
+ * ============================================================
+ */
+
+
 #define BLOCK_SIZE 256
 #define WARP_SIZE 32
 #define WARP_PER_BLOCK (BLOCK_SIZE / WARP_SIZE)
