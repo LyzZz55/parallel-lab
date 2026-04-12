@@ -25,7 +25,7 @@
 // 可在此处添加辅助 kernel 或 __device__ 函数
 // ------------------------------------------------------------
 
-#define BLOCK_SIZE 512
+#define BLOCK_SIZE 256
 #define WARP_SIZE 32
 #define WARP_PER_BLOCK BLOCK_SIZE/WARP_SIZE
 // 使用 warp shuffle 的高效 block 级 scan kernel
