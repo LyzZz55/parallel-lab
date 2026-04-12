@@ -84,7 +84,7 @@ __global__ void warp_block_scan_items(const int* d_in, int* d_out, int* d_block_
     }
 }
 
-__global__ void add_block_sums_items(int* d_out, int* d_block_sums_scanned, int n) {
+__global__ void add_block_sums_items(int* d_out, const int* d_block_sums_scanned, int n) {
     int tid = threadIdx.x;
     int bid = blockIdx.x;
     int base_idx = (bid * blockDim.x + tid) * ITEMS_PER_THREAD;
