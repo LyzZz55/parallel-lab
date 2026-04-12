@@ -44,7 +44,9 @@ __global__ void warp_block_scan_items(const int* d_in, int* d_out, int* d_block_
     // 每个 warp 的总和（由最后一个线程存储）
     int warp_total = __shfl_sync(0xffffffff, warp_incl, WARP_SIZE-1);
 
-    warp_sums[warp_id] = (lane_id == WARP_SIZE - 1) * warp_total;
+    if (lane_id == WARP_SIZE - 1) {
+        warp_sums[warp_id] = warp_total;
+    }
     __syncthreads();
 
     if (warp_id == 0) {
