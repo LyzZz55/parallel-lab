@@ -102,20 +102,21 @@ do { \
 } while(0)
 
 // ------------------------------------------------------------
-// 13-block kernel 实现（persistent blocks + 全局同步）
+// 13-block kernel 实现（warp 级协作 + 减少全局同步）
 // ------------------------------------------------------------
 __global__ void student_prefix_sum_13block_kernel(const int* in, int* out, int n) {
     const int BLOCK_SIZE = 256;
     const int EPT = 8;                     // 每个线程处理的元素个数
     const int TILE_SIZE = BLOCK_SIZE * EPT; // 2048
+    const int WARP_SIZE = 32;
 
     if (n <= 0) return;
 
     int num_tiles = (n + TILE_SIZE - 1) / TILE_SIZE;
     int num_iters = (num_tiles + gridDim.x - 1) / gridDim.x;
 
-    __shared__ int s_scan[BLOCK_SIZE];
-    __shared__ int s_vals[BLOCK_SIZE * EPT]; // 暂存局部扫描结果
+    __shared__ int s_warp_sums[8];
+    __shared__ int s_warp_prefix[8];
 
     for (int iter = 0; iter < num_iters; ++iter) {
         int tile_start = iter * gridDim.x;
@@ -124,13 +125,15 @@ __global__ void student_prefix_sum_13block_kernel(const int* in, int* out, int n
         int my_tile = tile_start + blockIdx.x;
         bool valid_tile = (blockIdx.x < cur_tiles);
 
-        // ---- 阶段 1: 局部 inclusive scan 与块总和 ----
+        int vals[EPT];           // 提升作用域，供阶段3使用
+        int block_exclusive = 0;
+
+        // ---- 阶段 1: 局部 inclusive scan 与块总和 (warp shuffle) ----
         if (valid_tile) {
             int tile_base = my_tile * TILE_SIZE;
             int base_idx = tile_base + threadIdx.x * EPT;
 
             int thread_sum = 0;
-            int vals[EPT];
             #pragma unroll
             for (int i = 0; i < EPT; ++i) {
                 int idx = base_idx + i;
@@ -139,41 +142,42 @@ __global__ void student_prefix_sum_13block_kernel(const int* in, int* out, int n
                 vals[i] = thread_sum;
             }
 
-            s_scan[threadIdx.x] = thread_sum;
-            __syncthreads();
+            int lane = threadIdx.x % WARP_SIZE;
+            int warp_id = threadIdx.x / WARP_SIZE;
+            int warp_scan = thread_sum;
 
-            // Kogge-Stone 块内包含扫描
-            for (int offset = 1; offset < BLOCK_SIZE; offset <<= 1) {
-                int tmp;
-                if (threadIdx.x >= offset) {
-                    tmp = s_scan[threadIdx.x] + s_scan[threadIdx.x - offset];
-                }
-                __syncthreads();
-                if (threadIdx.x >= offset) {
-                    s_scan[threadIdx.x] = tmp;
-                }
-                __syncthreads();
-            }
-
-            int block_offset = (threadIdx.x == 0) ? 0 : s_scan[threadIdx.x - 1];
-
-            // 最后一个线程负责写出本块总和
-            if (threadIdx.x == BLOCK_SIZE - 1) {
-                g_block_sums13[blockIdx.x] = s_scan[threadIdx.x];
-            }
-
-            // 将局部扫描结果存入共享内存供阶段 3 使用
             #pragma unroll
-            for (int i = 0; i < EPT; ++i) {
-                s_vals[threadIdx.x * EPT + i] = vals[i] + block_offset;
+            for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+                int n = __shfl_up_sync(0xffffffff, warp_scan, offset);
+                if (lane >= offset) warp_scan += n;
+            }
+
+            int warp_exclusive = warp_scan - thread_sum;
+            int warp_total = __shfl_sync(0xffffffff, warp_scan, WARP_SIZE - 1);
+
+            if (lane == WARP_SIZE - 1) {
+                s_warp_sums[warp_id] = warp_total;
             }
             __syncthreads();
+
+            if (threadIdx.x == 0) {
+                int accum = 0;
+                int num_warps = blockDim.x / WARP_SIZE;
+                for (int i = 0; i < num_warps; ++i) {
+                    s_warp_prefix[i] = accum;
+                    accum += s_warp_sums[i];
+                }
+                g_block_sums13[blockIdx.x] = accum;
+            }
+            __syncthreads();
+
+            block_exclusive = s_warp_prefix[warp_id] + warp_exclusive;
         }
 
         // ---- 全局同步 1 ----
         GRID_SYNC_13();
 
-        // ---- 阶段 2: block 0 计算块间偏移（exclusive scan of block sums） ----
+        // ---- 阶段 2: block 0 计算块间偏移 ----
         if (blockIdx.x == 0) {
             int accum = g_prefix_offset_13;
             for (int i = 0; i < cur_tiles; ++i) {
@@ -196,16 +200,15 @@ __global__ void student_prefix_sum_13block_kernel(const int* in, int* out, int n
             for (int i = 0; i < EPT; ++i) {
                 int idx = base_idx + i;
                 if (idx < n) {
-                    out[idx] = s_vals[threadIdx.x * EPT + i] + global_offset;
+                    out[idx] = vals[i] + block_exclusive + global_offset;
                 }
             }
         }
-
-        // ---- 全局同步 3 ----
-        GRID_SYNC_13();
     }
 
-    // 重置全局状态，为下一次 kernel 调用做准备
+    // 所有迭代完成后做一次全局同步，安全重置状态
+    GRID_SYNC_13();
+
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         g_mutex13 = 0;
         g_sense13 = 0;
@@ -218,14 +221,15 @@ __global__ void student_prefix_sum_26block_kernel(const int* in, int* out, int n
     const int BLOCK_SIZE = 256;
     const int EPT = 8;
     const int TILE_SIZE = BLOCK_SIZE * EPT;
+    const int WARP_SIZE = 32;
 
     if (n <= 0) return;
 
     int num_tiles = (n + TILE_SIZE - 1) / TILE_SIZE;
     int num_iters = (num_tiles + gridDim.x - 1) / gridDim.x;
 
-    __shared__ int s_scan[BLOCK_SIZE];
-    __shared__ int s_vals[BLOCK_SIZE * EPT];
+    __shared__ int s_warp_sums[8];
+    __shared__ int s_warp_prefix[8];
 
     for (int iter = 0; iter < num_iters; ++iter) {
         int tile_start = iter * gridDim.x;
@@ -234,12 +238,14 @@ __global__ void student_prefix_sum_26block_kernel(const int* in, int* out, int n
         int my_tile = tile_start + blockIdx.x;
         bool valid_tile = (blockIdx.x < cur_tiles);
 
+        int vals[EPT];
+        int block_exclusive = 0;
+
         if (valid_tile) {
             int tile_base = my_tile * TILE_SIZE;
             int base_idx = tile_base + threadIdx.x * EPT;
 
             int thread_sum = 0;
-            int vals[EPT];
             #pragma unroll
             for (int i = 0; i < EPT; ++i) {
                 int idx = base_idx + i;
@@ -248,32 +254,36 @@ __global__ void student_prefix_sum_26block_kernel(const int* in, int* out, int n
                 vals[i] = thread_sum;
             }
 
-            s_scan[threadIdx.x] = thread_sum;
-            __syncthreads();
-
-            for (int offset = 1; offset < BLOCK_SIZE; offset <<= 1) {
-                int tmp;
-                if (threadIdx.x >= offset) {
-                    tmp = s_scan[threadIdx.x] + s_scan[threadIdx.x - offset];
-                }
-                __syncthreads();
-                if (threadIdx.x >= offset) {
-                    s_scan[threadIdx.x] = tmp;
-                }
-                __syncthreads();
-            }
-
-            int block_offset = (threadIdx.x == 0) ? 0 : s_scan[threadIdx.x - 1];
-
-            if (threadIdx.x == BLOCK_SIZE - 1) {
-                g_block_sums26[blockIdx.x] = s_scan[threadIdx.x];
-            }
+            int lane = threadIdx.x % WARP_SIZE;
+            int warp_id = threadIdx.x / WARP_SIZE;
+            int warp_scan = thread_sum;
 
             #pragma unroll
-            for (int i = 0; i < EPT; ++i) {
-                s_vals[threadIdx.x * EPT + i] = vals[i] + block_offset;
+            for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+                int n = __shfl_up_sync(0xffffffff, warp_scan, offset);
+                if (lane >= offset) warp_scan += n;
+            }
+
+            int warp_exclusive = warp_scan - thread_sum;
+            int warp_total = __shfl_sync(0xffffffff, warp_scan, WARP_SIZE - 1);
+
+            if (lane == WARP_SIZE - 1) {
+                s_warp_sums[warp_id] = warp_total;
             }
             __syncthreads();
+
+            if (threadIdx.x == 0) {
+                int accum = 0;
+                int num_warps = blockDim.x / WARP_SIZE;
+                for (int i = 0; i < num_warps; ++i) {
+                    s_warp_prefix[i] = accum;
+                    accum += s_warp_sums[i];
+                }
+                g_block_sums26[blockIdx.x] = accum;
+            }
+            __syncthreads();
+
+            block_exclusive = s_warp_prefix[warp_id] + warp_exclusive;
         }
 
         GRID_SYNC_26();
@@ -298,13 +308,13 @@ __global__ void student_prefix_sum_26block_kernel(const int* in, int* out, int n
             for (int i = 0; i < EPT; ++i) {
                 int idx = base_idx + i;
                 if (idx < n) {
-                    out[idx] = s_vals[threadIdx.x * EPT + i] + global_offset;
+                    out[idx] = vals[i] + block_exclusive + global_offset;
                 }
             }
         }
-
-        GRID_SYNC_26();
     }
+
+    GRID_SYNC_26();
 
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         g_mutex26 = 0;
