@@ -103,7 +103,7 @@ do { \
 
 #define BLOCK_SIZE 256
 #define EPT 16
-#define TILE_SIZE (BLOCK_SIZE*EPT) // 2048
+#define TILE_SIZE (BLOCK_SIZE*EPT)
 #define WARP_SIZE 32
 
 // ------------------------------------------------------------
