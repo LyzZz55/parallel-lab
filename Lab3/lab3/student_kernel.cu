@@ -101,14 +101,15 @@ do { \
     __syncthreads(); \
 } while(0)
 
+#define BLOCK_SIZE 256
+#define EPT 16
+#define TILE_SIZE (BLOCK_SIZE*EPT) // 2048
+#define WARP_SIZE 32
+
 // ------------------------------------------------------------
 // 13-block kernel 实现（warp 级协作 + 减少全局同步）
 // ------------------------------------------------------------
 __global__ void student_prefix_sum_13block_kernel(const int* in, int* out, int n) {
-    const int BLOCK_SIZE = 256;
-    const int EPT = 8;                     // 每个线程处理的元素个数
-    const int TILE_SIZE = BLOCK_SIZE * EPT; // 2048
-    const int WARP_SIZE = 32;
 
     if (n <= 0) return;
 
@@ -218,11 +219,6 @@ __global__ void student_prefix_sum_13block_kernel(const int* in, int* out, int n
 
 
 __global__ void student_prefix_sum_26block_kernel(const int* in, int* out, int n) {
-    const int BLOCK_SIZE = 256;
-    const int EPT = 8;
-    const int TILE_SIZE = BLOCK_SIZE * EPT;
-    const int WARP_SIZE = 32;
-
     if (n <= 0) return;
 
     int num_tiles = (n + TILE_SIZE - 1) / TILE_SIZE;
