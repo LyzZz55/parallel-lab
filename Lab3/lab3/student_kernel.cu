@@ -1,320 +1,271 @@
-/*
- * ============================================================
- *  并行计算课程作业3：CUDA 单 Kernel 固定 Block 前缀和
- * ============================================================
- *
- * 任务：实现一个高效的 CUDA inclusive prefix sum。
- *
- * 给定长度为 n 的整型数组 d_in，计算：
- *   d_out[i] = d_in[0] + d_in[1] + ... + d_in[i]
- *
- * 要求：
- *   1. 只修改本文件
- *   2. 不得修改 student_prefix_sum_13block_kernel / student_prefix_sum_26block_kernel 的 kernel 签名
- *   3. 不得使用 Thrust / cuBLAS / cub 等高级库
- *   4. 需正确处理任意长度 n（不保证是 2 的幂次）
- *   5. 本文件中不要写 kernel launch，评测程序会固定用 <<<13, 256>>> 和 <<<26, 256>>> 调用
- *
- * 提交：将本文件上传至提交系统，文件名保持 student_kernel.cu
- * ============================================================
- */
-
 #include <cuda_runtime.h>
 
-// ------------------------------------------------------------
-// 全局变量：用于 13-block kernel 的同步与中间存储
-// ------------------------------------------------------------
-__device__ int g_mutex13 = 0;
-__device__ int g_sense13 = 0;
-__device__ int g_block_flags13[13];
-__device__ int g_block_sums13[13];
-__device__ int g_block_offsets13[13];
-__device__ int g_prefix_offset_13 = 0;
+#define ITEMS_13 24
+#define ITEMS_26 16
+#define TILE_SIZE_13 (256 * ITEMS_13)   // 6144
+#define TILE_SIZE_26 (256 * ITEMS_26)   // 4096
+#define MAX_TILES   (1 << 20)
 
-// ------------------------------------------------------------
-// 全局变量：用于 26-block kernel 的同步与中间存储
-// ------------------------------------------------------------
-__device__ int g_mutex26 = 0;
-__device__ int g_sense26 = 0;
-__device__ int g_block_flags26[26];
-__device__ int g_block_sums26[26];
-__device__ int g_block_offsets26[26];
-__device__ int g_prefix_offset_26 = 0;
 
-// ------------------------------------------------------------
-// 网格同步宏（13 block 版本）
-// ------------------------------------------------------------
-#define GRID_SYNC_13() \
-do { \
-    if (threadIdx.x == 0) { \
-        atomicExch(&g_block_flags13[blockIdx.x], 0); \
-    } \
-    __syncthreads(); \
-    if (threadIdx.x == 0) { \
-        __threadfence(); \
-        int token = atomicAdd(&g_mutex13, 1); \
-        if (token == gridDim.x - 1) { \
-            g_mutex13 = 0; \
-            int new_sense = 1 - atomicAdd(&g_sense13, 0); \
-            atomicExch(&g_sense13, new_sense); \
-            __threadfence(); \
-        } else { \
-            int sense = atomicAdd(&g_sense13, 0); \
-            while (atomicAdd(&g_sense13, 0) == sense) {} \
-            __threadfence(); \
-        } \
-        __threadfence(); \
-        atomicExch(&g_block_flags13[blockIdx.x], 1); \
-    } else { \
-        while (atomicAdd(&g_block_flags13[blockIdx.x], 0) == 0) {} \
-    } \
-    __syncthreads(); \
-} while(0)
+#define MAKE_DATA(stat, agg) (unsigned int)(((stat) << 30) | ((agg) & 0x3FFFFFFF))
+#define STAT(data) ((unsigned int)(data) >> 30)
+#define AGG(data)  ((int)((unsigned int)(data) & 0x3FFFFFFF))
 
-// ------------------------------------------------------------
-// 网格同步宏（26 block 版本）
-// ------------------------------------------------------------
-#define GRID_SYNC_26() \
-do { \
-    if (threadIdx.x == 0) { \
-        atomicExch(&g_block_flags26[blockIdx.x], 0); \
-    } \
-    __syncthreads(); \
-    if (threadIdx.x == 0) { \
-        __threadfence(); \
-        int token = atomicAdd(&g_mutex26, 1); \
-        if (token == gridDim.x - 1) { \
-            g_mutex26 = 0; \
-            int new_sense = 1 - atomicAdd(&g_sense26, 0); \
-            atomicExch(&g_sense26, new_sense); \
-            __threadfence(); \
-        } else { \
-            int sense = atomicAdd(&g_sense26, 0); \
-            while (atomicAdd(&g_sense26, 0) == sense) {} \
-            __threadfence(); \
-        } \
-        __threadfence(); \
-        atomicExch(&g_block_flags26[blockIdx.x], 1); \
-    } else { \
-        while (atomicAdd(&g_block_flags26[blockIdx.x], 0) == 0) {} \
-    } \
-    __syncthreads(); \
-} while(0)
+// ---------- 13 block 全局变量 ----------
+__device__ unsigned int tile_data_13[MAX_TILES];
+__device__ int          g_counter_13;
+__device__ unsigned int g_goal_13[13];
+__device__ volatile unsigned int g_in_13[13];
+__device__ volatile unsigned int g_out_13[13];
 
-#define BLOCK_SIZE 256
-#define EPT 16
-#define TILE_SIZE (BLOCK_SIZE*EPT)
-#define WARP_SIZE 32
+// ---------- 26 block 全局变量 ----------
+__device__ unsigned int tile_data_26[MAX_TILES];
+__device__ int          g_counter_26;
+__device__ unsigned int g_goal_26[26];
+__device__ volatile unsigned int g_in_26[26];
+__device__ volatile unsigned int g_out_26[26];
 
-// ------------------------------------------------------------
-// 13-block kernel 实现（warp 级协作 + 减少全局同步）
-// ------------------------------------------------------------
-__global__ void student_prefix_sum_13block_kernel(const int* in, int* out, int n) {
+// ---------- 全局软件栅栏 ----------
+__device__ void grid_barrier(unsigned int* goal_arr,
+                             volatile unsigned int* in_arr,
+                             volatile unsigned int* out_arr,
+                             int num_blocks) {
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
 
-    if (n <= 0) return;
+    __shared__ unsigned int s_goal;
+    if (tid == 0) {
+        unsigned int g = goal_arr[bid] + 1u;
+        goal_arr[bid] = g;
+        s_goal = g;
+    }
+    __syncthreads();
+    unsigned int goal = s_goal;
 
-    int num_tiles = (n + TILE_SIZE - 1) / TILE_SIZE;
-    int num_iters = (num_tiles + gridDim.x - 1) / gridDim.x;
+    __threadfence();
+    if (tid == 0) in_arr[bid] = goal;
 
-    __shared__ int s_warp_sums[8];
-    __shared__ int s_warp_prefix[8];
-
-    for (int iter = 0; iter < num_iters; ++iter) {
-        int tile_start = iter * gridDim.x;
-        int cur_tiles = num_tiles - tile_start;
-        if (cur_tiles > gridDim.x) cur_tiles = gridDim.x;
-        int my_tile = tile_start + blockIdx.x;
-        bool valid_tile = (blockIdx.x < cur_tiles);
-
-        int vals[EPT];           // 提升作用域，供阶段3使用
-        int block_exclusive = 0;
-
-        // ---- 阶段 1: 局部 inclusive scan 与块总和 (warp shuffle) ----
-        if (valid_tile) {
-            int tile_base = my_tile * TILE_SIZE;
-            int base_idx = tile_base + threadIdx.x * EPT;
-
-            int thread_sum = 0;
-            #pragma unroll
-            for (int i = 0; i < EPT; ++i) {
-                int idx = base_idx + i;
-                int v = (idx < n) ? in[idx] : 0;
-                thread_sum += v;
-                vals[i] = thread_sum;
-            }
-
-            int lane = threadIdx.x % WARP_SIZE;
-            int warp_id = threadIdx.x / WARP_SIZE;
-            int warp_scan = thread_sum;
-
-            #pragma unroll
-            for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
-                int n = __shfl_up_sync(0xffffffff, warp_scan, offset);
-                if (lane >= offset) warp_scan += n;
-            }
-
-            int warp_exclusive = warp_scan - thread_sum;
-            int warp_total = __shfl_sync(0xffffffff, warp_scan, WARP_SIZE - 1);
-
-            if (lane == WARP_SIZE - 1) {
-                s_warp_sums[warp_id] = warp_total;
-            }
-            __syncthreads();
-
-            if (threadIdx.x == 0) {
-                int accum = 0;
-                int num_warps = blockDim.x / WARP_SIZE;
-                for (int i = 0; i < num_warps; ++i) {
-                    s_warp_prefix[i] = accum;
-                    accum += s_warp_sums[i];
-                }
-                g_block_sums13[blockIdx.x] = accum;
-            }
-            __syncthreads();
-
-            block_exclusive = s_warp_prefix[warp_id] + warp_exclusive;
+    if (bid == 0) {
+        if (tid < num_blocks) {
+            while (in_arr[tid] != goal) { }
         }
-
-        // ---- 全局同步 1 ----
-        GRID_SYNC_13();
-
-        // ---- 阶段 2: block 0 计算块间偏移 ----
-        if (blockIdx.x == 0) {
-            int accum = g_prefix_offset_13;
-            for (int i = 0; i < cur_tiles; ++i) {
-                g_block_offsets13[i] = accum;
-                accum += g_block_sums13[i];
-            }
-            g_prefix_offset_13 = accum;
-        }
-
-        // ---- 全局同步 2 ----
-        GRID_SYNC_13();
-
-        // ---- 阶段 3: 加上全局偏移并写出最终结果 ----
-        if (valid_tile) {
-            int global_offset = g_block_offsets13[blockIdx.x];
-            int tile_base = my_tile * TILE_SIZE;
-            int base_idx = tile_base + threadIdx.x * EPT;
-
-            #pragma unroll
-            for (int i = 0; i < EPT; ++i) {
-                int idx = base_idx + i;
-                if (idx < n) {
-                    out[idx] = vals[i] + block_exclusive + global_offset;
-                }
-            }
+        __syncthreads();
+        __threadfence();
+        if (tid < num_blocks) {
+            out_arr[tid] = goal;
         }
     }
 
-    // 所有迭代完成后做一次全局同步，安全重置状态
-    GRID_SYNC_13();
+    if (tid == 0) {
+        while (out_arr[bid] != goal) { }
+    }
+    __syncthreads();
+}
 
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        g_mutex13 = 0;
-        g_sense13 = 0;
-        g_prefix_offset_13 = 0;
+template <int ITEMS_PER_THREAD, int TILE_SIZE>
+__device__ void prefix_sum_impl(const int* __restrict__ in,
+                                int* __restrict__ out,
+                                int n,
+                                unsigned int* tile_data,
+                                int* counter,
+                                unsigned int* goal_arr,
+                                volatile unsigned int* in_arr,
+                                volatile unsigned int* out_arr,
+                                int num_blocks) {
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int bdim = blockDim.x;            // 固定 256
+    const int num_warps = bdim / 32;        // 8
+    const int VEC = ITEMS_PER_THREAD / 4;   // int4 向量化因子
+
+    int num_tiles = (n + TILE_SIZE - 1) / TILE_SIZE;
+    if (num_tiles > MAX_TILES) num_tiles = MAX_TILES;
+    if (num_tiles == 0) return;
+
+    // --- 初始化：清零所有 tile 状态，重置计数器，并用栅栏保证完成 ---
+    for (int t = bid * bdim + tid; t < num_tiles; t += num_blocks * bdim) {
+        tile_data[t] = 0;
+    }
+    if (bid == 0 && tid == 0) {
+        *counter = 0;
+    }
+    __syncthreads();
+    grid_barrier(goal_arr, in_arr, out_arr, num_blocks);
+
+    // --- 共享内存：用于向量化加载/写回 + 块内扫描 ---
+    __shared__ int smem[TILE_SIZE];
+    __shared__ int s_warp_sums[32];
+    __shared__ int tile_agg;
+    __shared__ int exclusive_prefix;
+    __shared__ int s_tile_id;
+
+    int4* smem4 = reinterpret_cast<int4*>(smem);
+
+    // --- 主循环：动态领取 tile ---
+    while (true) {
+        if (tid == 0) {
+            s_tile_id = atomicAdd(counter, 1);
+        }
+        __syncthreads();
+        int tile_id = s_tile_id;
+        if (tile_id >= num_tiles) break;
+
+        int start = tile_id * TILE_SIZE;
+        bool full_tile = (start + TILE_SIZE <= n);
+
+        // 1. 向量化加载到共享内存
+        if (full_tile) {
+            const int4* in4 = reinterpret_cast<const int4*>(in + start);
+            #pragma unroll
+            for (int i = 0; i < VEC; ++i) {
+                smem4[i * bdim + tid] = in4[i * bdim + tid];
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+                int idx   = i * bdim + tid;
+                int g_idx = start + idx;
+                smem[idx] = (g_idx < n) ? in[g_idx] : 0;
+            }
+        }
+        __syncthreads();
+
+        // 2. 从共享内存读取到寄存器（线程本地连续排列）
+        int val[ITEMS_PER_THREAD];
+        #pragma unroll
+        for (int v = 0; v < VEC; ++v) {
+            int4 q = smem4[tid * VEC + v];
+            val[v * 4 + 0] = q.x;
+            val[v * 4 + 1] = q.y;
+            val[v * 4 + 2] = q.z;
+            val[v * 4 + 3] = q.w;
+        }
+
+        // 3. 线程内 inclusive scan
+        #pragma unroll
+        for (int k = 1; k < ITEMS_PER_THREAD; ++k) {
+            val[k] += val[k - 1];
+        }
+        int thread_sum = val[ITEMS_PER_THREAD - 1];
+
+        // 4. warp 级 inclusive scan
+        int warp_id = tid / 32;
+        int lane_id = tid & 31;
+        int warp_sum = thread_sum;
+        #pragma unroll
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            int n_val = __shfl_up_sync(0xffffffff, warp_sum, offset);
+            if (lane_id >= offset) warp_sum += n_val;
+        }
+        if (lane_id == 31) {
+            s_warp_sums[warp_id] = warp_sum;
+        }
+        __syncthreads();
+
+        // 5. 跨 warp 前缀
+        if (warp_id == 0) {
+            int w_sum = (lane_id < num_warps) ? s_warp_sums[lane_id] : 0;
+            unsigned mask = (1 << num_warps) - 1;
+            #pragma unroll
+            for (int offset = 1; offset < num_warps; offset <<= 1) {
+                int n_val = __shfl_up_sync(mask, w_sum, offset);
+                if (lane_id >= offset) w_sum += n_val;
+            }
+            if (lane_id < num_warps) {
+                s_warp_sums[lane_id] = w_sum - s_warp_sums[lane_id]; // 排他前缀
+            }
+        }
+        __syncthreads();
+
+        int warp_exclusive = (warp_id < num_warps) ? s_warp_sums[warp_id] : 0;
+        int block_exclusive = warp_exclusive + (warp_sum - thread_sum);
+
+        #pragma unroll
+        for (int k = 0; k < ITEMS_PER_THREAD; ++k) {
+            val[k] += block_exclusive;
+        }
+
+        // 6. 块内总和（用于全局 Look-back）
+        if (tid == bdim - 1) {
+            tile_agg = val[ITEMS_PER_THREAD - 1];
+        }
+        __syncthreads();
+        int local_tile_sum = tile_agg;
+
+        // 7. 状态更新与 Look-back（保持程序1的 32 位状态与原子读方式）
+        if (tid == 0) {
+            atomicExch(&tile_data[tile_id], MAKE_DATA(1, local_tile_sum));
+            __threadfence();
+
+            int ex = 0;
+            int j = tile_id - 1;
+            while (j >= 0) {
+                unsigned int raw = atomicAdd(&tile_data[j], 0);
+                int stat = STAT(raw);
+                int agg  = AGG(raw);
+
+                if (stat == 0) {
+                    __threadfence_block();
+                    continue;
+                } else if (stat == 1) {
+                    ex += agg;
+                    j--;
+                } else { // stat == 2
+                    ex += agg;
+                    break;
+                }
+            }
+            exclusive_prefix = ex;
+
+            atomicExch(&tile_data[tile_id], MAKE_DATA(2, ex + local_tile_sum));
+            __threadfence();
+        }
+        __syncthreads();
+
+        // 8. 写回结果（先写共享内存，再向量化存储）
+        int my_ex = exclusive_prefix;
+        #pragma unroll
+        for (int k = 0; k < ITEMS_PER_THREAD; ++k) {
+            val[k] += my_ex;
+        }
+
+        #pragma unroll
+        for (int v = 0; v < VEC; ++v) {
+            int4 q;
+            q.x = val[v * 4 + 0];
+            q.y = val[v * 4 + 1];
+            q.z = val[v * 4 + 2];
+            q.w = val[v * 4 + 3];
+            smem4[tid * VEC + v] = q;
+        }
+        __syncthreads();
+
+        if (full_tile) {
+            int4* out4 = reinterpret_cast<int4*>(out + start);
+            #pragma unroll
+            for (int i = 0; i < VEC; ++i) {
+                out4[i * bdim + tid] = smem4[i * bdim + tid];
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+                int idx   = i * bdim + tid;
+                int g_idx = start + idx;
+                if (g_idx < n) out[g_idx] = smem[idx];
+            }
+        }
+        __syncthreads(); // 确保写回完成，下一轮可安全复用 smem
     }
 }
 
+// ---------- 固定 13 block 入口 ----------
+__global__ void student_prefix_sum_13block_kernel(const int* d_in, int* d_out, int n) {
+    prefix_sum_impl<ITEMS_13, TILE_SIZE_13>(d_in, d_out, n,
+        tile_data_13, &g_counter_13, g_goal_13, g_in_13, g_out_13, 13);
+}
 
-__global__ void student_prefix_sum_26block_kernel(const int* in, int* out, int n) {
-    if (n <= 0) return;
-
-    int num_tiles = (n + TILE_SIZE - 1) / TILE_SIZE;
-    int num_iters = (num_tiles + gridDim.x - 1) / gridDim.x;
-
-    __shared__ int s_warp_sums[8];
-    __shared__ int s_warp_prefix[8];
-
-    for (int iter = 0; iter < num_iters; ++iter) {
-        int tile_start = iter * gridDim.x;
-        int cur_tiles = num_tiles - tile_start;
-        if (cur_tiles > gridDim.x) cur_tiles = gridDim.x;
-        int my_tile = tile_start + blockIdx.x;
-        bool valid_tile = (blockIdx.x < cur_tiles);
-
-        int vals[EPT];
-        int block_exclusive = 0;
-
-        if (valid_tile) {
-            int tile_base = my_tile * TILE_SIZE;
-            int base_idx = tile_base + threadIdx.x * EPT;
-
-            int thread_sum = 0;
-            #pragma unroll
-            for (int i = 0; i < EPT; ++i) {
-                int idx = base_idx + i;
-                int v = (idx < n) ? in[idx] : 0;
-                thread_sum += v;
-                vals[i] = thread_sum;
-            }
-
-            int lane = threadIdx.x % WARP_SIZE;
-            int warp_id = threadIdx.x / WARP_SIZE;
-            int warp_scan = thread_sum;
-
-            #pragma unroll
-            for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
-                int n = __shfl_up_sync(0xffffffff, warp_scan, offset);
-                if (lane >= offset) warp_scan += n;
-            }
-
-            int warp_exclusive = warp_scan - thread_sum;
-            int warp_total = __shfl_sync(0xffffffff, warp_scan, WARP_SIZE - 1);
-
-            if (lane == WARP_SIZE - 1) {
-                s_warp_sums[warp_id] = warp_total;
-            }
-            __syncthreads();
-
-            if (threadIdx.x == 0) {
-                int accum = 0;
-                int num_warps = blockDim.x / WARP_SIZE;
-                for (int i = 0; i < num_warps; ++i) {
-                    s_warp_prefix[i] = accum;
-                    accum += s_warp_sums[i];
-                }
-                g_block_sums26[blockIdx.x] = accum;
-            }
-            __syncthreads();
-
-            block_exclusive = s_warp_prefix[warp_id] + warp_exclusive;
-        }
-
-        GRID_SYNC_26();
-
-        if (blockIdx.x == 0) {
-            int accum = g_prefix_offset_26;
-            for (int i = 0; i < cur_tiles; ++i) {
-                g_block_offsets26[i] = accum;
-                accum += g_block_sums26[i];
-            }
-            g_prefix_offset_26 = accum;
-        }
-
-        GRID_SYNC_26();
-
-        if (valid_tile) {
-            int global_offset = g_block_offsets26[blockIdx.x];
-            int tile_base = my_tile * TILE_SIZE;
-            int base_idx = tile_base + threadIdx.x * EPT;
-
-            #pragma unroll
-            for (int i = 0; i < EPT; ++i) {
-                int idx = base_idx + i;
-                if (idx < n) {
-                    out[idx] = vals[i] + block_exclusive + global_offset;
-                }
-            }
-        }
-    }
-
-    GRID_SYNC_26();
-
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        g_mutex26 = 0;
-        g_sense26 = 0;
-        g_prefix_offset_26 = 0;
-    }
+// ---------- 固定 26 block 入口 ----------
+__global__ void student_prefix_sum_26block_kernel(const int* d_in, int* d_out, int n) {
+    prefix_sum_impl<ITEMS_26, TILE_SIZE_26>(d_in, d_out, n,
+        tile_data_26, &g_counter_26, g_goal_26, g_in_26, g_out_26, 26);
 }
