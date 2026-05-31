@@ -26,7 +26,7 @@ __device__ volatile unsigned int g_in_26[26];
 __device__ volatile unsigned int g_out_26[26];
 
 // ---------- 全局软件栅栏 ----------
-__device__ void grid_barrier(unsigned int* goal_arr,
+__device__ __forceinline__ void grid_barrier(unsigned int* goal_arr,
                              volatile unsigned int* in_arr,
                              volatile unsigned int* out_arr,
                              int num_blocks) {
@@ -42,25 +42,28 @@ __device__ void grid_barrier(unsigned int* goal_arr,
     __syncthreads();
     unsigned int goal = s_goal;
 
-    __threadfence();
-    if (tid == 0) in_arr[bid] = goal;
-
-    if (bid == 0) {
-        if (tid < num_blocks) {
-            while (in_arr[tid] != goal) { }
-        }
-        __syncthreads();
-        __threadfence();
-        if (tid < num_blocks) {
-            out_arr[tid] = goal;
-        }
-    }
-
+    // 到达
     if (tid == 0) {
-        while (out_arr[bid] != goal) { }
+        atomicExch((unsigned int*)&in_arr[bid], goal);
     }
-    __syncthreads();
+
+    // 释放
+    if (bid == 0 && tid == 0) {
+        for (int i = 0; i < num_blocks; i++) {
+            while (atomicAdd((unsigned int*)&in_arr[i], 0) != goal) { }
+        }
+        for (int i = 0; i < num_blocks; i++) {
+            atomicExch((unsigned int*)&out_arr[i], goal);
+        }
+    }
+
+    // 等待释放
+    if (bid != 0 || tid != 0) {
+        while (atomicAdd((unsigned int*)&out_arr[bid], 0) != goal) { }
+    }
+    __syncthreads();   // 保证块内所有线程在栅栏处对齐
 }
+
 
 template <int ITEMS_PER_THREAD, int TILE_SIZE>
 __device__ void prefix_sum_impl(const int* __restrict__ in,
@@ -82,7 +85,7 @@ __device__ void prefix_sum_impl(const int* __restrict__ in,
     if (num_tiles > MAX_TILES) num_tiles = MAX_TILES;
     if (num_tiles == 0) return;
 
-    // --- 初始化：清零所有 tile 状态，重置计数器，并用栅栏保证完成 ---
+    // 初始化：清零所有 tile 状态，重置计数器，并用栅栏保证完成
     for (int t = bid * bdim + tid; t < num_tiles; t += num_blocks * bdim) {
         tile_data[t] = 0;
     }
@@ -92,16 +95,15 @@ __device__ void prefix_sum_impl(const int* __restrict__ in,
     __syncthreads();
     grid_barrier(goal_arr, in_arr, out_arr, num_blocks);
 
-    // --- 共享内存：用于向量化加载/写回 + 块内扫描 ---
+    // 共享内存：用于向量化加载/写回 + 块内扫描
     __shared__ int smem[TILE_SIZE];
     __shared__ int s_warp_sums[32];
-    __shared__ int tile_agg;
     __shared__ int exclusive_prefix;
     __shared__ int s_tile_id;
 
     int4* smem4 = reinterpret_cast<int4*>(smem);
 
-    // --- 主循环：动态领取 tile ---
+    // 主循环：动态领取 tile
     while (true) {
         if (tid == 0) {
             s_tile_id = atomicAdd(counter, 1);
@@ -185,15 +187,10 @@ __device__ void prefix_sum_impl(const int* __restrict__ in,
             val[k] += block_exclusive;
         }
 
-        // 6. 块内总和（用于全局 Look-back）
         if (tid == bdim - 1) {
-            tile_agg = val[ITEMS_PER_THREAD - 1];
-        }
-        __syncthreads();
-        int local_tile_sum = tile_agg;
+            int local_tile_sum = val[ITEMS_PER_THREAD - 1];
 
-        // 7. 状态更新与 Look-back（保持程序1的 32 位状态与原子读方式）
-        if (tid == 0) {
+            // 原来 tid == 0 的状态更新与 Look-back
             atomicExch(&tile_data[tile_id], MAKE_DATA(1, local_tile_sum));
             __threadfence();
 
@@ -220,9 +217,9 @@ __device__ void prefix_sum_impl(const int* __restrict__ in,
             atomicExch(&tile_data[tile_id], MAKE_DATA(2, ex + local_tile_sum));
             __threadfence();
         }
-        __syncthreads();
+        __syncthreads();  // 保证所有线程看到 exclusive_prefix
 
-        // 8. 写回结果（先写共享内存，再向量化存储）
+        // 7. 写回结果（先写共享内存，再向量化存储）
         int my_ex = exclusive_prefix;
         #pragma unroll
         for (int k = 0; k < ITEMS_PER_THREAD; ++k) {
@@ -258,13 +255,11 @@ __device__ void prefix_sum_impl(const int* __restrict__ in,
     }
 }
 
-// ---------- 固定 13 block 入口 ----------
 __global__ void student_prefix_sum_13block_kernel(const int* d_in, int* d_out, int n) {
     prefix_sum_impl<ITEMS_13, TILE_SIZE_13>(d_in, d_out, n,
         tile_data_13, &g_counter_13, g_goal_13, g_in_13, g_out_13, 13);
 }
 
-// ---------- 固定 26 block 入口 ----------
 __global__ void student_prefix_sum_26block_kernel(const int* d_in, int* d_out, int n) {
     prefix_sum_impl<ITEMS_26, TILE_SIZE_26>(d_in, d_out, n,
         tile_data_26, &g_counter_26, g_goal_26, g_in_26, g_out_26, 26);
